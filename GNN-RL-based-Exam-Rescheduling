@@ -1,0 +1,424 @@
+!pip install torch
+!pip install networkx
+!pip install torch-geometric
+
+import numpy as np
+
+class GridWorldMDP:
+    def __init__(self, width, height, terminal_state, terminal_reward):
+        self.width = width
+        self.height = height
+        self.terminal_state = terminal_state
+        self.terminal_reward = terminal_reward
+        self.state = (0, 0)
+
+    def reset(self):
+        self.state = (0, 0)
+
+    def set(self, action):
+        x, y = self.state
+        if action == "up" and y < self.height - 1:
+            y += 1
+        elif action == "down" and y > 0:
+            y -= 1
+        elif action == "left" and x > 0:
+            x -= 1
+        elif action == "right" and x < self.width - 1:
+            x += 1
+
+        self.state = (x, y)
+
+        if self.state == self.terminal_state:
+            reward = self.terminal_reward
+            done = True
+        else:
+            reward = 0
+            done = False
+
+        return np.array(self.state), reward, done
+
+
+import numpy as np
+import networkx as nx
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import time
+
+# Define the Graph Neural Network (GNN) model
+class GNN(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(GNN, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x, adjacency_matrix):
+        x = F.relu(torch.matmul(adjacency_matrix.float(), self.fc1(x)))
+        x = self.fc2(x)
+        return x
+
+# Define the Custom Grid Environment (Timetable)
+class CustomGridEnvironment:
+    def __init__(self):
+        self.width = 2  # Number of slots per day
+        self.height = 6  # Number of days (Monday to Saturday)
+        self.G = nx.grid_2d_graph(self.width, self.height)
+
+        # Initialize rewards and actions
+        self.rewards = {(0, 0): 0, (1, 0): 0, (0, 1): 0, (1, 1): 0, (0, 2): 0, (1, 2): 0,
+                        (0, 3): 0, (1, 3): 0, (0, 4): 0, (1, 4): 0, (0, 5): 0, (1, 5): 0}
+
+        # Introduce empty slots by modifying rewards
+        empty_slots = [(0, 3), (1, 4)]  # Define some empty slots
+        for slot in empty_slots:
+            self.rewards[slot] = 5  # High reward for utilizing empty slots
+
+        self.actions = {
+            (0, 0): ('D',),
+            (1, 0): ('R', 'U'),
+            (0, 1): ('D', 'L'),
+            (1, 1): ('D', 'U'),
+            (0, 2): ('D',),
+            (1, 2): ('U',),
+            (0, 3): ('D',),  # Empty slot available
+            (1, 3): ('U',),
+            (0, 4): ('D',),  # Empty slot available
+            (1, 4): ('U',),
+            (0, 5): ('D',),
+            (1, 5): ('U',)
+        }
+
+        # Exam types and venue capacities
+        self.exam_types = ['Math', 'Physics', 'Chemistry', 'English', 'Biology', 'History']
+        self.venue_capacities = {'Auditorium': 200, 'Lecture Hall ET': 100, 'Lecture Hall CSE': 80}
+
+        # Venue availability
+        self.venue_availability = {
+            'Auditorium': {'Math': True, 'Physics': True, 'Chemistry': False, 'English': True, 'Biology': True, 'History': True},
+            'Lecture Hall ET': {'Math': True, 'Physics': False, 'Chemistry': True, 'English': False, 'Biology': True, 'History': True},
+            'Lecture Hall CSE': {'Math': False, 'Physics': True, 'Chemistry': True, 'English': True, 'Biology': False, 'History': True},
+        }
+
+        # Convert graph to adjacency matrix
+        self.adjacency_matrix = torch.tensor(nx.adjacency_matrix(self.G).todense(), dtype=torch.float32)
+        self.input_features = torch.zeros((len(self.G), 1), dtype=torch.float32, requires_grad=True)
+        self.venue_features = torch.zeros((len(self.G), len(self.exam_types) + 1), dtype=torch.float32, requires_grad=True)
+
+        # Initialize GNN model and optimizer
+        self.gnn_model = GNN(input_size=len(self.venue_features[0]), hidden_size=32, output_size=len(self.exam_types))
+        self.optimizer = optim.Adam(self.gnn_model.parameters(), lr=0.01)
+
+    def value_iteration(self, num_iterations=100):
+        for _ in range(num_iterations):
+            gnn_output = self.gnn_model(self.venue_features, self.adjacency_matrix)
+            updated_values, _ = torch.max(gnn_output, dim=-1)
+
+            # Calculate rewards based on the current policy
+            node_rewards = {node: self.rewards.get(node, 0) for node in self.G.nodes}
+            updated_rewards = torch.tensor([node_rewards[node] for node in self.G.nodes()], dtype=torch.float32)
+
+            # Update input features without in-place operation
+            self.input_features = torch.zeros_like(self.input_features)  # Clear previous values
+            self.input_features[:, 0] = updated_values + updated_rewards  # Set new values
+
+            # Create a diversified policy
+            final_values = {node: self.input_features[node[0], 0].item() for node in self.G.nodes()}
+            policy = {}
+            for node in self.G.nodes():
+                best_value = final_values[node]
+                best_actions = [n for n in self.G.neighbors(node) if self.input_features[n[0], 0].item() == best_value and n in self.actions]
+                if best_actions:
+                    policy[node] = best_actions[np.random.choice(len(best_actions))]  # Randomly choose among the best actions
+
+            pos = {(x, y): (y, -x) for x, y in self.G.nodes()}
+            labels = {node: f'({node[0]},{node[1]}) \n Value={final_values[node]:.2f} \n Policy={policy[node]}' for node in self.G.nodes()}
+
+        plt.figure(figsize=(10, 10))
+        nx.draw(self.G, pos, with_labels=True, labels=labels, node_size=700, node_color='lightblue', font_size=10, font_weight='bold')
+        plt.title("Exam Timetable Environment")
+        plt.show()
+
+    def venue_iteration(self, num_iterations=100):
+        for _ in range(num_iterations):
+            gnn_output = self.gnn_model(self.venue_features, self.adjacency_matrix)
+            preference_scores = gnn_output.squeeze(1)
+
+            # Normalize preference scores
+            preference_scores = (preference_scores - preference_scores.min()) / (preference_scores.max() - preference_scores.min())
+
+            # Scheduling logic with venue allocation
+            for exam_type in self.exam_types:
+                best_venue_index = torch.argmax(preference_scores)
+                best_venue_name = list(self.G.nodes())[int(best_venue_index)]
+
+                # Allocate the exam to the best venue if it's available
+                if self.allocate_exam(exam_type, best_venue_name):
+                    for i, node in enumerate(self.G.nodes()):
+                        if node == best_venue_name:
+                            self.venue_features[i, 0] -= 1  # Reduce venue capacity
+                            self.venue_features[i, self.exam_types.index(exam_type) + 1] = 0  # Mark venue as unavailable
+
+        # Print the final venue allocations
+        for exam_type in self.exam_types:
+            for venue_name, availability in self.venue_availability.items():
+                if not availability[exam_type]:
+                    print(f"{exam_type} is scheduled in {venue_name}")
+
+    def is_venue_available(self, exam_type: str, venue: str):
+        if venue not in self.venue_availability:
+            return False
+
+        if exam_type not in self.venue_availability[venue]:
+            print(f"Exam type '{exam_type}' not found for venue '{venue}'.")
+            return False
+
+        return self.venue_availability[venue][exam_type]
+
+    def allocate_exam(self, exam_type, venue):
+        if self.is_venue_available(exam_type, venue):
+            self.venue_availability[venue][exam_type] = False
+            return True
+        else:
+            return False
+
+# Create a custom grid environment instance
+custom_grid_env = CustomGridEnvironment()
+
+# Run value iteration and venue iteration
+start_time = time.time()
+custom_grid_env.value_iteration()
+custom_grid_env.venue_iteration()
+end_time = time.time()
+elapsed_time = end_time - start_time
+print("*" * 49)
+print(f"Time taken to learn the policy: {elapsed_time:.2f} seconds")
+print("*" * 49)
+
+
+
+
+
+import numpy as np
+import random
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+
+# Define the Graph Neural Network (GNN) model
+class GNN(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(GNN, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x, adjacency_matrix):
+        x = F.relu(torch.matmul(adjacency_matrix.float(), self.fc1(x)))
+        x = self.fc2(x)
+        return x
+
+# Define the Timetable class
+class Timetable:
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+        self.i = 0  # Initial position
+        self.j = 0  # Initial position
+        self.actions = {
+            (0, 0): ('D',),
+            (1, 0): ('R', 'U'),
+            (0, 1): ('D', 'L'),
+            (1, 1): ('D', 'U'),
+            (0, 2): ('D',),
+            (1, 2): ('U',),
+            (0, 3): ('D',),  # Empty slot available
+            (1, 3): ('U',),
+            (0, 4): ('D',),  # Empty slot available
+            (1, 4): ('U',),
+            (0, 5): ('D',),
+            (1, 5): ('U',)
+        }
+
+        # Initialize rewards with empty slots having higher rewards
+        self.rewards = {(x, y): 0 for x in range(width) for y in range(height)}
+        empty_slots = [(0, 3), (1, 4)]  # Define empty slots
+        for slot in empty_slots:
+            self.rewards[slot] = 5  # High reward for utilizing empty slots
+
+        # Initialize the GNN model and optimizer
+        input_size = 1  # Adjust according to feature size
+        hidden_size = 16
+        output_size = len(self.actions)  # Assuming output matches the number of actions
+        self.gnn = GNN(input_size, hidden_size, output_size)
+        self.optimizer = optim.Adam(self.gnn.parameters(), lr=0.01)
+
+        # Create adjacency matrix (adjust as needed)
+        self.adjacency_matrix = torch.eye(len(self.actions))  # Placeholder for an adjacency matrix
+
+    def current_state(self):
+        return (self.i, self.j)
+
+    def is_terminal(self, s):
+        return s not in self.actions
+
+    def move(self, action):
+        if action in self.actions.get((self.i, self.j), []):
+            if action == 'U':
+                self.i -= 1
+            elif action == 'D':
+                self.i += 1
+            elif action == 'R':
+                self.j += 1
+            elif action == 'L':
+                self.j -= 1
+        return self.rewards.get((self.i, self.j), 0)
+
+    def terminated(self):
+        return (self.i, self.j) not in self.actions
+
+    def all_states(self):
+        return set(self.actions.keys()) | set(self.rewards.keys())
+
+    def value_iteration(self, num_iterations=1000):
+        input_features = torch.zeros((len(self.actions), 1), dtype=torch.float32)  # Feature representation for states
+        for _ in range(num_iterations):
+            q_values = self.gnn(input_features, self.adjacency_matrix)
+            v_values, _ = torch.max(q_values, dim=1)
+            targets = torch.matmul(self.adjacency_matrix, v_values.unsqueeze(1)).squeeze()  # Using Bellman equation
+            loss = F.mse_loss(q_values, targets.unsqueeze(1))
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+        # Diversify the policy based on the learned values
+        _, policy = torch.max(q_values, dim=1)
+        diverse_policy = {}
+
+        for state in range(len(self.actions)):
+            # Get the corresponding state key from the actions dictionary
+            state_key = list(self.actions.keys())[state]
+            best_action = policy[state].item()
+            action_candidates = [action for action in self.actions[state_key] if self.actions[state_key].index(action) == best_action]
+            if action_candidates:
+                diverse_policy[state_key] = random.choice(action_candidates)
+
+        return diverse_policy
+
+# Initialize the Timetable instance and run value iteration
+timetable = Timetable(width=2, height=6)
+final_policy = timetable.value_iteration()
+print("Final policy:")
+print(final_policy)
+
+
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Visualization
+grid_width = 2  # Adjusted to match the original grid dimensions
+grid_height = 6  # Adjusted to match the original grid dimensions
+
+# Get the final policy from the Timetable instance
+final_policy = timetable.value_iteration()  # Get the diverse policy mapping
+
+# Define the actions corresponding to each index in the final policy
+actions = ['U', 'D', 'L', 'R']
+
+# Prepare the mapping of the final policy for visualization
+final_policy_mapping = {}
+for state, action in final_policy.items():
+    if state in timetable.actions:  # Ensure the state is valid
+        final_policy_mapping[state] = action  # Store the action directly
+
+# Plot the grid and overlay the actions based on the final policy
+plt.figure(figsize=(grid_width, grid_height))
+for i in range(grid_height):
+    for j in range(grid_width):
+        state = (j, i)  # Map 2D coordinates to state
+        if state in final_policy_mapping:  # Check if grid location is in the final policy
+            action = final_policy_mapping[state]
+            plt.text(j, i, action, ha='center', va='center', fontsize=12, fontweight='bold')
+        else:
+            plt.text(j, i, "", ha='center', va='center')  # Leave cell empty if not in final policy
+
+# Set plot limits and invert y-axis
+plt.xlim(-0.5, grid_width - 0.5)
+plt.ylim(grid_height - 0.5, -0.5)
+plt.gca().invert_yaxis()  # Invert y-axis to match grid indexing
+
+# Set ticks and grid
+plt.xticks(np.arange(grid_width))
+plt.yticks(np.arange(grid_height))
+plt.grid(True)
+
+plt.title("Final Policy Visualization")
+plt.show()
+
+
+
+
+
+# timetable incorporating venue details
+def create_timetable(final_policy):
+    # timetable structure
+    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+    slots = ["Slot 1", "Slot 2"]
+
+    #  timetable as a nested dictionary
+    timetable = {day: {slot: None for slot in slots} for day in days}
+
+    # Mapping exams to venues based on above output
+    venue_mapping = {
+        'Math': 'Lecture Hall CSE',
+        'English': 'Lecture Hall ET',
+        'Biology': 'Lecture Hall CSE',
+        'History': 'Lecture Hall PG',
+        'Physics': 'Lecture Hall CSE',
+        'Chemistry': 'Auditorium',
+        'Accounting': 'Lecture Hall PG',
+        'Anatomy': 'Auditorium',
+        'Free Slot': ['Lecture Hall PG','Lecture Hall CSE']
+    }
+
+    # Populating the timetable based on the final policy
+    for (j, i), action in final_policy.items():
+        day = days[i]  # Map row index to day
+        slot = slots[j]  # Map column index to slot
+
+        # venue based on the action
+        venue = venue_mapping.get(action, "Unknown Venue")
+
+        # Store the action and venue in the timetable
+        timetable[day][slot] = f"{action} in {venue}"
+
+    return timetable
+
+# Generate the timetable with venue details
+final_policy = {
+    (0, 0): 'Free Slot', (1, 0): 'English', (0, 1): 'Math',
+    (1, 1): 'Free Slot', (0, 2): 'Chemistry', (1, 2): 'Free Slot',
+    (0, 3): 'Biology', (1, 3): 'Accounting', (0, 4): 'Free Slot',
+    (1, 4): 'Physics', (0, 5): 'History', (1, 5): 'Anatomy'
+}
+final_timetable = create_timetable(final_policy)
+
+# Print the timetable in a human-readable format
+print("New Timetable:")
+for day, slots in final_timetable.items():
+    print(f"{day}:")
+    for slot, action in slots.items():
+        print(f"  {slot}: {action if action else 'Free'}")
+    print()
+
+
+
+
+
+
+
+
